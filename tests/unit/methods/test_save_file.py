@@ -120,15 +120,14 @@ async def test_a_part_the_server_refused_reaches_the_caller(three_parts: str) ->
 
 
 @pytest.mark.asyncio
-async def test_the_parts_around_the_refused_one_are_still_sent(three_parts: str) -> None:
+async def test_a_failed_part_stops_the_upload_before_later_parts_are_sent(three_parts: str) -> None:
     media = Media(rejects_part=1)
 
     with pytest.raises(ConnectionError):
         await uploader(media).save_file(three_parts)
 
-    # The upload is not aborted mid-way: a worker that stops consuming leaves the producer
-    #  blocked on a queue of size one, so every part is offered and only the answer is remembered.
-    assert media.saved_parts == [0, 2]
+    # Cancellation wakes the producer even when its one-slot queue is full.
+    assert media.saved_parts == [0]
 
 
 @pytest.mark.asyncio
@@ -373,3 +372,270 @@ async def test_stop_transmission_from_a_progress_callback_ends_the_upload(
     saved_parts = media.saved_parts.copy()
     await asyncio.sleep(0)
     assert media.saved_parts == saved_parts
+
+
+@pytest.mark.asyncio
+async def test_failed_big_upload_cancels_blocked_siblings_without_draining_file() -> None:
+    class FailedMedia(BlockingMedia):
+        async def invoke(self, query) -> None:
+            self.sent_parts.append(query.file_part)
+            if len(self.sent_parts) == 4:
+                self.workers_started.set()
+            if query.file_part == 0:
+                await self.workers_started.wait()
+                raise ConnectionError("part retry budget exhausted")
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self._cancelled_parts.append(query.file_part)
+                raise
+
+    media = FailedMedia(workers_count=4)
+    file = TrackedFile(b"x" * (32 * _PART_SIZE))
+    client = uploader(media)
+    with pytest.raises(ConnectionError, match="part retry budget exhausted"):
+        await asyncio.wait_for(client.save_file(file), timeout=1)
+    assert len(media.sent_parts) == 4
+    assert len(media._cancelled_parts) == 3
+    assert not file.closed
+    assert not client.save_file_semaphore.locked()
+    before = media.sent_parts.copy()
+    await asyncio.sleep(0)
+    assert media.sent_parts == before
+
+
+@pytest.mark.asyncio
+async def test_upload_without_acknowledged_progress_times_out_and_joins_worker(monkeypatch) -> None:
+    monkeypatch.setattr(SaveFile, "UPLOAD_STALL_TIMEOUT", 0.05, raising=False)
+    media = BlockingMedia()
+    file = TrackedFile(b"x")
+    client = uploader(media)
+    with pytest.raises(TimeoutError, match="acknowledged progress"):
+        await asyncio.wait_for(client.save_file(file), timeout=1)
+    assert media.workers_cancelled.is_set()
+    assert not client.save_file_semaphore.locked()
+    assert not file.closed
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_progress_allows_upload_longer_than_stall_budget(monkeypatch) -> None:
+    monkeypatch.setattr(SaveFile, "UPLOAD_STALL_TIMEOUT", 0.2, raising=False)
+
+    class SlowMedia(Media):
+        async def invoke(self, query) -> None:
+            await asyncio.sleep(0.04)
+            await super().invoke(query)
+
+    media = SlowMedia()
+    file = TrackedFile(b"x" * (8 * _PART_SIZE))
+    result = await asyncio.wait_for(uploader(media).save_file(file), timeout=2)
+    assert isinstance(result, raw.types.InputFile)
+    assert media.saved_parts == list(range(8))
+
+
+@pytest.mark.asyncio
+async def test_provider_flood_wait_is_not_mistaken_for_stalled_upload(monkeypatch) -> None:
+    monkeypatch.setattr(SaveFile, "UPLOAD_STALL_TIMEOUT", 0.05, raising=False)
+
+    class RateLimitedMedia(Media):
+        attempts = 0
+
+        async def invoke(self, query) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise FloodWait(1)
+            await super().invoke(query)
+
+    media = RateLimitedMedia()
+    result = await asyncio.wait_for(uploader(media).save_file(TrackedFile(b"x")), timeout=2)
+    assert isinstance(result, raw.types.InputFile)
+    assert media.attempts == 2
+    assert media.saved_parts == [0]
+
+
+@pytest.mark.asyncio
+async def test_callback_failure_retires_watchdog_even_if_wait_for_consumes_cancellation(
+    monkeypatch,
+) -> None:
+    wait_for = asyncio.wait_for
+    watching = asyncio.Event()
+
+    async def consume_watcher_cancel(awaitable, timeout):
+        if timeout is not None and timeout > 100:
+            watching.set()
+            try:
+                return await wait_for(awaitable, timeout)
+            except asyncio.CancelledError:
+                # Reproduce the Python 3.10 completed-event cancellation race.
+                return True
+        return await wait_for(awaitable, timeout)
+
+    async def failed_callback(*args):
+        await watching.wait()
+        raise RuntimeError("progress callback aborted")
+
+    monkeypatch.setattr(
+        "pyrogram.methods.advanced.save_file.asyncio.wait_for", consume_watcher_cancel
+    )
+    client = uploader(Media())
+    with pytest.raises(RuntimeError, match="progress callback aborted"):
+        await wait_for(client.save_file(TrackedFile(b"x"), progress=failed_callback), timeout=1)
+    assert not client.save_file_semaphore.locked()
+
+
+@pytest.mark.asyncio
+async def test_stalled_progress_callback_is_cancelled_before_upload_returns(monkeypatch) -> None:
+    monkeypatch.setattr(SaveFile, "UPLOAD_STALL_TIMEOUT", 0.05)
+    cancelled = asyncio.Event()
+    hold = asyncio.Event()
+
+    async def stalled_callback(*args):
+        try:
+            await hold.wait()
+        finally:
+            cancelled.set()
+
+    media = Media()
+    with pytest.raises(TimeoutError, match="acknowledged progress"):
+        await asyncio.wait_for(
+            uploader(media).save_file(TrackedFile(b"x"), progress=stalled_callback), timeout=1
+        )
+    assert cancelled.is_set()
+    assert media.saved_parts == [0]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_rpc_cannot_resume_worker_after_provider_swallows_cancellation() -> None:
+    class SwallowingMedia(BlockingMedia):
+        async def invoke(self, query):
+            self.sent_parts.append(query.file_part)
+            if len(self.sent_parts) == 4:
+                self.workers_started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                return
+
+    media = SwallowingMedia(workers_count=4)
+    upload = asyncio.create_task(uploader(media).save_file(TrackedFile(b"x" * (32 * _PART_SIZE))))
+    await media.workers_started.wait()
+    upload.cancel()
+    try:
+        await await_cancelled(upload)
+        assert len(media.sent_parts) == 4
+    finally:
+        # A regressed worker can be waiting on its queue after consuming cancellation.
+        for task in asyncio.all_tasks():
+            if task is not asyncio.current_task() and ".worker" in task.get_coro().__qualname__:
+                task.cancel()
+        media.release.set()
+        if not upload.done():
+            upload.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await upload
+
+
+@pytest.mark.asyncio
+async def test_cancelled_callback_cannot_resume_producer_after_consuming_cancellation() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def swallowing_callback(*args):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            return
+
+    media = Media()
+    upload = asyncio.create_task(
+        uploader(media).save_file(
+            TrackedFile(b"x" * (8 * _PART_SIZE)), progress=swallowing_callback
+        )
+    )
+    await started.wait()
+    upload.cancel()
+    try:
+        await await_cancelled(upload)
+        before = media.saved_parts.copy()
+        await asyncio.sleep(0)
+        assert media.saved_parts == before
+    finally:
+        release.set()
+        for task in asyncio.all_tasks():
+            if task is not asyncio.current_task() and ".produce" in task.get_coro().__qualname__:
+                task.cancel()
+        if not upload.done():
+            upload.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await upload
+
+
+@pytest.mark.asyncio
+async def test_cancellation_consumed_as_flood_wait_cannot_hold_upload_cleanup() -> None:
+    class SwallowingFloodMedia(BlockingMedia):
+        async def invoke(self, query):
+            self.workers_started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                raise FloodWait(3600) from None
+
+    media = SwallowingFloodMedia()
+    upload = asyncio.create_task(uploader(media).save_file(TrackedFile(b"x")))
+    await media.workers_started.wait()
+    upload.cancel()
+    try:
+        await await_cancelled(upload)
+    finally:
+        for task in asyncio.all_tasks():
+            if task is not asyncio.current_task() and ".worker" in task.get_coro().__qualname__:
+                task.cancel()
+        media.release.set()
+        if not upload.done():
+            upload.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await upload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("when", ["part", "sentinel"])
+async def test_consumed_queue_cancellation_cannot_resume_producer(monkeypatch, when) -> None:
+    queue_type = asyncio.Queue
+    entered = asyncio.Event()
+    hold = asyncio.Event()
+    callbacks = []
+
+    class SwallowingQueue(queue_type):
+        async def put(self, item):
+            if not entered.is_set() and ((item is None) == (when == "sentinel")):
+                entered.set()
+                try:
+                    await hold.wait()
+                except asyncio.CancelledError:
+                    return
+            return await super().put(item)
+
+    async def progress(*args):
+        callbacks.append(args)
+
+    monkeypatch.setattr("pyrogram.methods.advanced.save_file.asyncio.Queue", SwallowingQueue)
+    media = Media()
+    upload = asyncio.create_task(
+        uploader(media).save_file(TrackedFile(b"x" * (32 * _PART_SIZE)), progress=progress)
+    )
+    await entered.wait()
+    before = len(callbacks)
+    upload.cancel()
+    try:
+        await await_cancelled(upload)
+        assert len(callbacks) == before
+    finally:
+        hold.set()
+        for task in asyncio.all_tasks():
+            if task is not asyncio.current_task() and ".produce" in task.get_coro().__qualname__:
+                task.cancel()
+        if not upload.done():
+            upload.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await upload

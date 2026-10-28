@@ -29,7 +29,7 @@ from hashlib import md5
 from typing import TYPE_CHECKING, BinaryIO, overload
 
 import pyrogram
-from pyrogram import StopTransmission, raw
+from pyrogram import raw
 from pyrogram.errors import FloodPremiumWait, FloodWait
 
 if TYPE_CHECKING:
@@ -41,6 +41,9 @@ log = logging.getLogger(__name__)
 
 
 class SaveFile:
+    # A large transfer may run for hours while acknowledged parts keep moving.
+    UPLOAD_STALL_TIMEOUT: float = 180.0
+
     # The three shapes below are what the body already does, so a caller storing the result
     #  into a required `InputFile` field is not asked to handle a `None` the arguments it
     #  passed cannot produce.
@@ -156,32 +159,41 @@ class SaveFile:
             if path is None:
                 return None
 
-            failures: list[Exception] = []
+            loop = asyncio.get_running_loop()
+            last_progress = loop.time()
+            flood_wait_until = last_progress
+            progress_event = asyncio.Event()
+            finished = False
 
             async def worker(session):
-                while True:
+                nonlocal last_progress, flood_wait_until
+                while not finished:
                     data = await queue.get()
 
                     if data is None:
                         return
 
-                    while True:
+                    while not finished:
                         try:
                             await session.invoke(data)
+                            last_progress = loop.time()
+                            progress_event.set()
                             break
                         except (FloodWait, FloodPremiumWait) as e:
+                            if finished:
+                                return
                             log.warning(
                                 f"[{self.name}] Waiting for {e.seconds} seconds before continuing "
                                 f"(required by {type(data).__name__} in save_file worker)"
                             )
+                            flood_wait_until = max(flood_wait_until, loop.time() + e.seconds)
+                            progress_event.set()
                             await asyncio.sleep(e.seconds)
                         except Exception as e:
-                            # Keep consuming after a failed part: stopping this worker would
-                            # leave the producer blocked on the one-slot queue. The failure is
-                            # raised after every worker has drained its sentinel.
+                            # The coordinator cancels the producer and sibling workers;
+                            # continuing here would retry every remaining part of a doomed file.
                             log.exception(e)
-                            failures.append(e)
-                            break
+                            raise
 
             part_size = 512 * 1024
 
@@ -224,19 +236,13 @@ class SaveFile:
 
                 session = await self.get_session(dc_id, is_media=True)
                 queue = asyncio.Queue(1)
-                workers = [asyncio.create_task(worker(session)) for _ in range(workers_count)]
-                cancel_workers = False
+                last_progress = loop.time()
 
-                async def cancel_and_wait_for_workers() -> None:
-                    for upload_worker in workers:
-                        upload_worker.cancel()
-
-                    await asyncio.gather(*workers, return_exceptions=True)
-
-                try:
+                async def produce():
+                    nonlocal file_part, md5_sum
                     fp.seek(part_size * file_part)
 
-                    while True:
+                    while not finished:
                         chunk = fp.read(part_size)
 
                         if not chunk:
@@ -257,6 +263,8 @@ class SaveFile:
                             )
 
                         await queue.put(rpc)
+                        if finished:
+                            return
 
                         if is_missing_part:
                             break
@@ -280,32 +288,63 @@ class SaveFile:
                                 await asyncio.get_running_loop().run_in_executor(
                                     self.executor, func
                                 )
-                except (asyncio.CancelledError, StopTransmission):
-                    cancel_workers = True
-                    raise
-                except Exception as e:
-                    log.exception(e)
-                    raise
-                finally:
-                    try:
-                        if cancel_workers:
-                            await cancel_and_wait_for_workers()
-                        else:
-                            for _ in workers:
-                                await queue.put(None)
+                    if not finished:
+                        for _ in range(workers_count):
+                            if finished:
+                                return
+                            await queue.put(None)
+                            if finished:
+                                return
 
-                            await asyncio.gather(*workers)
-                    except asyncio.CancelledError:
-                        await cancel_and_wait_for_workers()
-                        raise
+                async def watch_progress():
+                    while not finished:
+                        progress_event.clear()
+                        remaining = (
+                            max(last_progress, flood_wait_until)
+                            + self.UPLOAD_STALL_TIMEOUT
+                            - loop.time()
+                        )
+                        if remaining <= 0:
+                            log.error(
+                                "Upload stalled without acknowledged progress: dc=%s parts=%s timeout=%s",
+                                dc_id,
+                                file_total_parts,
+                                self.UPLOAD_STALL_TIMEOUT,
+                            )
+                            raise TimeoutError("Upload stalled without acknowledged progress")
+                        try:
+                            await asyncio.wait_for(progress_event.wait(), timeout=remaining)
+                        except asyncio.TimeoutError:
+                            # Re-read the deadline: another worker may have reported a
+                            # provider-mandated wait while this timer was expiring.
+                            continue
+
+                producer = asyncio.create_task(produce())
+                workers = [asyncio.create_task(worker(session)) for _ in range(workers_count)]
+                work = asyncio.gather(producer, *workers)
+                watchdog = asyncio.create_task(watch_progress())
+                try:
+                    done, _ = await asyncio.wait(
+                        (work, watchdog), return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if work in done:
+                        await work
+                    else:
+                        await watchdog
+                finally:
+                    # Python 3.10 wait_for can consume cancellation when its event
+                    # completes concurrently; the owner flag still retires the watcher.
+                    finished = True
+                    progress_event.set()
+                    # A worker failure must wake a producer blocked on the one-slot queue.
+                    # Join every child before closing the file or releasing the semaphore.
+                    for task in (producer, *workers, watchdog):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(work, producer, *workers, watchdog, return_exceptions=True)
             finally:
                 if owns_file:
                     fp.close()
-
-            # A worker only reports a failed part once it has drained its sentinel, so a check any
-            # earlier can miss it.
-            if failures:
-                raise failures[0]
 
             if is_missing_part:
                 return None
